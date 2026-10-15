@@ -39,14 +39,28 @@ def node_fetch_pr(state):
 
 def node_analyze(state):
     console.print("[cyan]→ analyze[/cyan]")
-    llm = get_llm().with_structured_output(PRAnalysis)
+    llm = get_llm()
+    llm.max_tokens = 2000
+    structured_llm = llm.with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
-        analysis = llm.invoke([
-            {"role": "system", "content": (
-                "Senior reviewer. Structured output. "
-                # TODO: add an instruction: if confidence < 60%, populate escalation_questions
-                # with 2–4 specific, context-rich questions (reference which file/section in the diff).
-            )},
+        analysis = structured_llm.invoke([
+            {
+                "role": "system",
+                "content": (
+                    "You are a senior code reviewer. Analyze the pull request diff thoroughly.\n"
+                    "Provide:\n"
+                    "- summary: One-paragraph description of what the PR does\n"
+                    "- comments: List of review comments (file, line, severity: nit/suggestion/issue/blocker, body)\n"
+                    "- risk_factors: List of identified risks\n"
+                    "- confidence: Self-reported confidence score between 0.0 and 1.0:\n"
+                    "  * >= 0.73: Completely trivial (typo fixes, docs, pure one-line refactor) with 0 issues.\n"
+                    "  * 0.58 - 0.72: Features, schema additions, or moderate changes that need human eyes (~65%).\n"
+                    "  * < 0.58: Risky changes (security flaws, plaintext secrets, SQL injection, no tests) (< 58%).\n"
+                    "- confidence_reasoning: Detailed explanation of why this confidence score was chosen\n"
+                    "- escalation_questions: If confidence < 0.58, you MUST populate escalation_questions "
+                    "with 2–4 specific, context-rich questions (referencing specific files, lines, or design choices in the diff)."
+                ),
+            },
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.escalation_questions)} question(s)")
@@ -71,22 +85,54 @@ def node_escalate(state: ReviewState) -> dict:
         # fallback when the LLM didn't generate any questions
         questions = ["What is the intent of this PR?", "Any migration concerns?"]
 
-    # TODO: call interrupt(payload) where payload kind="escalation" contains:
-    #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
-    # answers = interrupt({...})
-    # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
+    answers = interrupt({
+        "kind": "escalation",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "risk_factors": a.risk_factors,
+        "questions": questions,
+    })
+    return {"escalation_answers": answers}
 
 
 def node_synthesize(state: ReviewState) -> dict:
     """Re-prompt LLM with the reviewer's answers and produce a refined review."""
-    # TODO:
-    #   - read state["escalation_answers"] (dict[question, answer])
-    #   - call get_llm().with_structured_output(PRAnalysis).invoke(...) with a prompt
-    #     containing the original diff + initial analysis + Q&A.
-    #   - return {"analysis": refined}
-    # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
+    console.print("[cyan]→ synthesize[/cyan]")
+    a = state["analysis"]
+    answers = state.get("escalation_answers") or {}
+    qa_text = "\n".join(f"Q: {q}\nA: {ans}" for q, ans in answers.items())
+    llm = get_llm()
+    llm.max_tokens = 2000
+    structured_llm = llm.with_structured_output(PRAnalysis)
+    with console.status("[dim]LLM refining review with reviewer answers...[/dim]"):
+        refined = structured_llm.invoke([
+            {
+                "role": "system",
+                "content": (
+                    "You are a senior code reviewer. You previously reviewed a pull request and escalated specific questions to a human reviewer.\n"
+                    "The human reviewer has now provided answers.\n"
+                    "Synthesize an updated, refined PR review:\n"
+                    "- Update the summary and review comments based on the human's clarifications.\n"
+                    "- Important: Keep any unaddressed or unresolved risks in risk_factors and comments. Do NOT artificially inflate confidence if serious security or design risks remain.\n"
+                    "- Re-evaluate confidence and provide confidence_reasoning based on whether the answers adequately resolved the concerns."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Title: {state.get('pr_title', '')}\n"
+                    f"Diff:\n{state.get('pr_diff', '')}\n\n"
+                    f"Initial Summary: {a.summary}\n"
+                    f"Initial Risks: {a.risk_factors}\n"
+                    f"Initial Confidence: {a.confidence:.0%}\n\n"
+                    f"Reviewer Q&A:\n{qa_text}"
+                ),
+            },
+        ])
+    console.print(f"  [green]✓[/green] refined confidence={refined.confidence:.0%}")
+    return {"analysis": refined}
 
 
 def node_human_approval(state):
@@ -98,10 +144,16 @@ def node_human_approval(state):
         "comments": [c.model_dump() for c in a.comments],
         "diff_preview": state["pr_diff"][:2000],
     })
-    return {"human_choice": response.get("choice"), "human_feedback": response.get("feedback")}
+    return {
+        "human_choice": response.get("choice"),
+        "human_feedback": response.get("feedback"),
+        "posted_comment_body": response.get("edited_body"),
+    }
 
 
 def _render_comment_body(state) -> str:
+    if state.get("posted_comment_body"):
+        return state["posted_comment_body"]
     a = state["analysis"]
     lines = [f"### Automated review (confidence {a.confidence:.0%})", "", a.summary, ""]
     for c in a.comments:
@@ -128,11 +180,11 @@ def _post(state, label: str) -> str:
 def node_commit(state):
     console.print("[cyan]→ commit[/cyan]")
     # Two paths converge here:
-    #   1. human_approval → commit (only post if approved)
+    #   1. human_approval → commit (only post if approved or edited)
     #   2. escalate → synthesize → commit (always post the refined review)
     if state.get("escalation_answers"):
         return {"final_action": _post(state, "committed_after_escalation")}
-    if state.get("human_choice") == "approve":
+    if state.get("human_choice") in ("approve", "edit"):
         return {"final_action": _post(state, "committed")}
     console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
     return {"final_action": "rejected"}
@@ -161,7 +213,8 @@ def build_graph():
     g.add_edge("auto_approve", END)
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
-    # TODO: wire escalate → synthesize → commit  (commit already → END)
+    g.add_edge("escalate", "synthesize")
+    g.add_edge("synthesize", "commit")
     return g.compile(checkpointer=MemorySaver())
 
 
@@ -173,8 +226,19 @@ def handle_interrupt(payload):
             title=f"Approve? conf={payload['confidence']:.0%}",
             border_style="green",
         ))
-        choice = console.input("approve/reject/edit? ").strip().lower()
-        return {"choice": choice, "feedback": console.input("Feedback: ").strip()}
+        choice = ""
+        while choice not in {"approve", "reject", "edit"}:
+            choice = console.input("approve/reject/edit? ").strip().lower()
+        feedback = console.input("Feedback: ").strip()
+        if choice == "edit":
+            body = ""
+            while not body.strip():
+                body = console.input("Edited comment body (required): ").strip()
+            confirm = console.input("Confirm posting edited review? (y/n): ").strip().lower()
+            if confirm not in {"y", "yes"}:
+                return {"choice": "reject", "feedback": "Edit cancelled"}
+            return {"choice": "edit", "feedback": feedback, "edited_body": body}
+        return {"choice": choice, "feedback": feedback}
     if kind == "escalation":
         console.print(Panel.fit(
             payload["summary"],

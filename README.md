@@ -7,7 +7,39 @@ A 2-hour lab that builds a human-in-the-loop pull-request review agent in **Lang
 > 3. Confidence ~58% → escalate: show context + specific questions for the reviewer.
 > 4. Every interaction is written to a SQLite audit trail; full sessions can be replayed.
 
-Students complete **4 exercises** (`exercises/`) that together build the full system. Each exercise has a runnable skeleton with `# TODO:` markers — your job is to fill them in.
+The solution includes **5 exercises**: four CLI exercises in `exercises/` and the Streamlit UI in `app.py`.
+
+## Running the completed solution on Windows
+
+Run commands from the repository root. SQLite is the selected lab backend; no PostgreSQL setup is required.
+
+```powershell
+uv sync
+# Create .env from .env.example only if it does not already exist.
+# Set OPENROUTER_API_KEY, GITHUB_TOKEN, and GITHUB_USER in .env.
+uv run python -X utf8 -m streamlit run app.py
+```
+
+Routing uses the exact code thresholds: `confidence >= 0.73` auto-posts, `0.58 <= confidence < 0.73` requests approval, and `< 0.58` escalates. LLM confidence is variable; the demo values are examples, not fixed assertions. Posting creates a top-level PR discussion comment, not a Git commit, merge, or formal GitHub approval.
+
+The UI supports Approve, Reject, and direct editing of the full review text. Edited text must be non-empty and explicitly confirmed. After escalation Q&A, the UI requires a final confirmation of the synthesized review. CLI exercises 3 and 4 retain the assignment's direct-post behavior after synthesis. Approve and Confirm & Post create real GitHub comments.
+
+The URL query parameter `?thread=<id>` restores the checkpoint after browser refresh or a server restart. Select past sessions from the sidebar. A completed session opens for inspection without posting again. If an API call failed and the checkpoint contains unfinished work, use **Retry Saved Step**; it continues the stored work without fetching the PR again or losing the submitted Q&A.
+
+Exercise 4 and the UI use `LLM_MAX_TOKENS=600` by default. Override it in `.env` if needed. An OpenRouter 402 error means the current request exceeds available credit; reducing the output budget may help, but does not guarantee that the account has sufficient credit. Restart Streamlit after editing imported graph modules or environment settings. Use Python's `-X utf8` on Windows to support the CLI's Unicode output.
+
+```powershell
+uv run python -X utf8 -m exercises.exercise_1_confidence --pr https://github.com/VinUni-AI20k/PR-Demo/pull/1
+uv run python -X utf8 -m exercises.exercise_2_hitl --pr https://github.com/VinUni-AI20k/PR-Demo/pull/1
+uv run python -X utf8 -m exercises.exercise_3_escalation --pr https://github.com/VinUni-AI20k/PR-Demo/pull/2
+uv run python -X utf8 -m exercises.exercise_4_audit --pr https://github.com/VinUni-AI20k/PR-Demo/pull/1
+uv run python -X utf8 -m exercises.exercise_4_audit --thread <thread_id>
+uv run python -X utf8 -m audit.replay --list
+uv run python -X utf8 -m audit.replay --thread <thread_id>
+uv run python -X utf8 -m unittest discover -s tests -v
+```
+
+The automated acceptance tests mock GitHub and the LLM, use isolated SQLite databases, and never create external comments. They cover routing boundaries, approval/rejection/editing, durable checkpoint resumption, escalation confirmation, API-failure recovery, audit ordering, and Streamlit editing/rejection. Audit events record reviewer Q&A and distinguish posting failures (`decision='failed'`) from human rejection. Secrets, database files, and SQLite sidecar files are ignored by Git.
 
 ## Background — what problem does this solve?
 
